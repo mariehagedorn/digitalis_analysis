@@ -1,0 +1,1185 @@
+#!/usr/bin/env Rscript
+
+
+############################################################
+# Digitalis purpurea
+# DAB image quantification workflow
+#
+# Step 7: Pixel-Based DAB Quantification
+#
+# Purpose:
+# - Use illumination-corrected images and final leaf masks
+#   generated in Step 6
+# - Calculate a continuous brown-sensitive optical-density
+#   score for every leaf pixel
+# - Correct the score using a negative-control leaf
+# - Retain extremely dark pixels through an additional
+#   dark-rescue channel
+# - Calculate leaf-level DAB burden metrics
+# - Generate globally standardized DAB maps for QC
+#
+# The exact Step-6 leaf mask is retained.
+# No additional Step-7 shadow removal is performed.
+#
+# Raw images and generated outputs are not included in
+# this repository.
+############################################################
+
+
+############################################################
+# 1. Load packages
+############################################################
+
+suppressPackageStartupMessages({
+  library(magick)
+  library(png)
+})
+
+
+############################################################
+# 2. Run Step 6
+############################################################
+
+source(
+  file.path(
+    "DAB-Image_Quantification",
+    "scripts",
+    "step6_leaf_segmentation.R"
+  )
+)
+
+
+if (!exists("step7_input_table")) {
+  stop(
+    "Step 6 did not create 'step7_input_table'."
+  )
+}
+
+
+############################################################
+# 3. Analysis parameters
+############################################################
+
+processing_long_side_px <- 1200
+
+# Negative-control percentile used for the brown-sensitive
+# score.
+brown_nc_percentile <- 0.99
+
+# Negative-control percentile used for the extreme-dark
+# rescue channel.
+dark_nc_percentile <- 0.995
+
+
+############################################################
+# 4. Parameters for standardized QC maps
+############################################################
+
+number_of_brown_classes <- 15
+
+
+global_class_probabilities <- c(
+  0.08,
+  0.16,
+  0.24,
+  0.32,
+  0.40,
+  0.48,
+  0.56,
+  0.64,
+  0.72,
+  0.80,
+  0.86,
+  0.91,
+  0.95,
+  0.98
+)
+
+
+brown_colours <- c(
+  "#FAF4ED",
+  "#F4E5D2",
+  "#ECD2AE",
+  "#E1BA8C",
+  "#D39F6C",
+  "#C18452",
+  "#AD6C40",
+  "#985734",
+  "#84462C",
+  "#713823",
+  "#602D1E",
+  "#502419",
+  "#401C15",
+  "#301410",
+  "#21100D"
+)
+
+
+############################################################
+# 5. Define output directories
+############################################################
+
+output_dir <- file.path(
+  "DAB-Image_Quantification",
+  "results",
+  "step7_DAB_quantification"
+)
+
+map_dir <- file.path(
+  output_dir,
+  "DAB_maps"
+)
+
+pixel_dir <- file.path(
+  output_dir,
+  "pixel_scores"
+)
+
+
+dir.create(
+  map_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  pixel_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+
+############################################################
+# 6. Identify negative control and biological leaves
+############################################################
+
+is_negative_control <- (
+  tolower(step7_input_table$image_role) %in%
+    c(
+      "negative_control",
+      "negative control",
+      "nc"
+    )
+)
+
+
+negative_control <- step7_input_table[
+  is_negative_control,
+]
+
+biological_leaves <- step7_input_table[
+  !is_negative_control,
+]
+
+
+if (nrow(negative_control) != 1) {
+  stop(
+    "Exactly one negative-control image is required."
+  )
+}
+
+
+############################################################
+# 7. Read image and matching leaf mask
+############################################################
+
+read_image_mask_pair <- function(
+  image_file,
+  mask_file
+) {
+
+  image <- image_read(
+    image_file
+  )
+
+  mask <- image_read(
+    mask_file
+  )
+
+
+  image_info_current <- image_info(
+    image
+  )
+
+  mask_info_current <- image_info(
+    mask
+  )
+
+
+  if (
+    image_info_current$width[1] !=
+      mask_info_current$width[1] ||
+    image_info_current$height[1] !=
+      mask_info_current$height[1]
+  ) {
+
+    stop(
+      "Analysis image and leaf mask dimensions differ."
+    )
+  }
+
+
+  ##########################################################
+  # Resize image and mask proportionally for analysis
+  ##########################################################
+
+  resize_factor <- min(
+    1,
+    processing_long_side_px /
+      max(
+        image_info_current$width[1],
+        image_info_current$height[1]
+      )
+  )
+
+
+  processing_width <- max(
+    2,
+    round(
+      image_info_current$width[1] *
+      resize_factor
+    )
+  )
+
+  processing_height <- max(
+    2,
+    round(
+      image_info_current$height[1] *
+      resize_factor
+    )
+  )
+
+
+  geometry <- sprintf(
+    "%dx%d!",
+    processing_width,
+    processing_height
+  )
+
+
+  image <- image_resize(
+    image,
+    geometry,
+    filter = "Lanczos"
+  )
+
+
+  mask <- image_resize(
+    mask,
+    geometry,
+    filter = "point"
+  )
+
+
+  ##########################################################
+  # Convert to numeric arrays
+  ##########################################################
+
+  image_file_tmp <- tempfile(
+    fileext = ".png"
+  )
+
+  mask_file_tmp <- tempfile(
+    fileext = ".png"
+  )
+
+
+  image_write(
+    image,
+    image_file_tmp,
+    format = "png"
+  )
+
+  image_write(
+    mask,
+    mask_file_tmp,
+    format = "png"
+  )
+
+
+  rgb <- png::readPNG(
+    image_file_tmp
+  )
+
+  mask_array <- png::readPNG(
+    mask_file_tmp
+  )
+
+
+  unlink(
+    c(
+      image_file_tmp,
+      mask_file_tmp
+    )
+  )
+
+
+  if (
+    length(dim(rgb)) == 3 &&
+    dim(rgb)[3] > 3
+  ) {
+
+    rgb <- rgb[, , 1:3]
+  }
+
+
+  if (
+    length(dim(mask_array)) == 3
+  ) {
+
+    mask_array <- mask_array[, , 1]
+  }
+
+
+  leaf_mask <- (
+    mask_array >= 0.5
+  )
+
+
+  list(
+    rgb = rgb,
+    leaf_mask = leaf_mask
+  )
+}
+
+
+############################################################
+# 8. Calculate pixel-level optical-density components
+############################################################
+
+calculate_pixel_components <- function(rgb) {
+
+  red <- pmin(
+    pmax(
+      rgb[, , 1],
+      0
+    ),
+    1
+  )
+
+  green <- pmin(
+    pmax(
+      rgb[, , 2],
+      0
+    ),
+    1
+  )
+
+  blue <- pmin(
+    pmax(
+      rgb[, , 3],
+      0
+    ),
+    1
+  )
+
+
+  ##########################################################
+  # Optical density
+  ##########################################################
+
+  od_red <- -log(
+    (
+      red * 255 + 1
+    ) / 256
+  )
+
+  od_green <- -log(
+    (
+      green * 255 + 1
+    ) / 256
+  )
+
+  od_blue <- -log(
+    (
+      blue * 255 + 1
+    ) / 256
+  )
+
+
+  ##########################################################
+  # Brown-sensitive chromatic component
+  ##########################################################
+
+  red_to_green <- pmax(
+    od_green -
+      od_red,
+    0
+  )
+
+
+  green_to_blue <- pmax(
+    od_blue -
+      od_green,
+    0
+  )
+
+
+  chromatic_brownness <- sqrt(
+    red_to_green *
+    green_to_blue
+  )
+
+
+  ##########################################################
+  # Overall optical density
+  ##########################################################
+
+  mean_optical_density <- (
+    od_red +
+    od_green +
+    od_blue
+  ) / 3
+
+
+  ##########################################################
+  # Brown-sensitive raw score
+  ##########################################################
+
+  brown_raw_score <- (
+    chromatic_brownness *
+    mean_optical_density
+  )
+
+
+  brown_raw_score[
+    !is.finite(
+      brown_raw_score
+    )
+  ] <- 0
+
+
+  mean_optical_density[
+    !is.finite(
+      mean_optical_density
+    )
+  ] <- 0
+
+
+  list(
+    brown_raw_score =
+      brown_raw_score,
+
+    mean_optical_density =
+      mean_optical_density
+  )
+}
+
+
+############################################################
+# 9. Calculate negative-control thresholds
+############################################################
+
+negative_pair <- read_image_mask_pair(
+  negative_control$analysis_image[1],
+  negative_control$leaf_mask_file[1]
+)
+
+
+negative_components <-
+  calculate_pixel_components(
+    negative_pair$rgb
+  )
+
+
+negative_brown_values <-
+  negative_components$brown_raw_score[
+    negative_pair$leaf_mask
+  ]
+
+
+negative_od_values <-
+  negative_components$mean_optical_density[
+    negative_pair$leaf_mask
+  ]
+
+
+brown_cutoff <- as.numeric(
+  quantile(
+    negative_brown_values,
+    brown_nc_percentile,
+    na.rm = TRUE,
+    type = 8
+  )
+)
+
+
+dark_cutoff <- as.numeric(
+  quantile(
+    negative_od_values,
+    dark_nc_percentile,
+    na.rm = TRUE,
+    type = 8
+  )
+)
+
+
+############################################################
+# 10. Correct brown score and apply Dark Rescue
+############################################################
+
+calculate_DAB_scores <- function(
+  components,
+  leaf_mask
+) {
+
+  ##########################################################
+  # Negative-control corrected brown score
+  ##########################################################
+
+  brown_corrected <- pmax(
+    components$brown_raw_score -
+      brown_cutoff,
+    0
+  )
+
+
+  ##########################################################
+  # Dark Rescue
+  #
+  # Retains extremely dark pixels that exceed the
+  # negative-control OD threshold.
+  ##########################################################
+
+  dark_excess_od <- pmax(
+    components$mean_optical_density -
+      dark_cutoff,
+    0
+  )
+
+
+  dark_candidate <- (
+    dark_excess_od *
+    components$mean_optical_density
+  )
+
+
+  ##########################################################
+  # Combined continuous DAB score
+  #
+  # The stronger of the brown-sensitive signal and the
+  # extreme-dark signal is retained. This avoids double
+  # counting pixels positive in both channels.
+  ##########################################################
+
+  combined_score <- pmax(
+    brown_corrected,
+    dark_candidate
+  )
+
+
+  ##########################################################
+  # Additional contribution made specifically by Dark Rescue
+  ##########################################################
+
+  dark_rescue_only <- pmax(
+    dark_candidate -
+      brown_corrected,
+    0
+  )
+
+
+  brown_corrected[
+    !leaf_mask
+  ] <- 0
+
+  dark_candidate[
+    !leaf_mask
+  ] <- 0
+
+  dark_rescue_only[
+    !leaf_mask
+  ] <- 0
+
+  combined_score[
+    !leaf_mask
+  ] <- 0
+
+
+  list(
+    brown_corrected =
+      brown_corrected,
+
+    dark_candidate =
+      dark_candidate,
+
+    dark_rescue_only =
+      dark_rescue_only,
+
+    combined_score =
+      combined_score
+  )
+}
+
+
+############################################################
+# 11. Calibrate global DAB-map classes
+#
+# Classification is used only for visual QC.
+# Quantitative analysis uses the continuous scores.
+############################################################
+
+positive_score_list <- vector(
+  "list",
+  nrow(biological_leaves)
+)
+
+
+for (
+  i in seq_len(
+    nrow(biological_leaves)
+  )
+) {
+
+  pair <- read_image_mask_pair(
+    biological_leaves$analysis_image[i],
+    biological_leaves$leaf_mask_file[i]
+  )
+
+
+  components <- calculate_pixel_components(
+    pair$rgb
+  )
+
+
+  scores <- calculate_DAB_scores(
+    components,
+    pair$leaf_mask
+  )
+
+
+  positive_score_list[[i]] <-
+    scores$combined_score[
+      pair$leaf_mask &
+      scores$combined_score > 0
+    ]
+}
+
+
+pooled_positive_scores <- unlist(
+  positive_score_list,
+  use.names = FALSE
+)
+
+
+internal_breaks <- as.numeric(
+  quantile(
+    pooled_positive_scores,
+    global_class_probabilities,
+    na.rm = TRUE,
+    type = 8
+  )
+)
+
+
+############################################################
+# Make class boundaries strictly increasing
+############################################################
+
+for (
+  i in 2:length(
+    internal_breaks
+  )
+) {
+
+  if (
+    internal_breaks[i] <=
+    internal_breaks[i - 1]
+  ) {
+
+    internal_breaks[i] <-
+      internal_breaks[i - 1] +
+      max(
+        abs(
+          internal_breaks[i - 1]
+        ) * 1e-9,
+        1e-12
+      )
+  }
+}
+
+
+class_breaks <- c(
+  0,
+  internal_breaks,
+  Inf
+)
+
+
+############################################################
+# 12. Convert continuous scores to QC colour classes
+############################################################
+
+create_DAB_map <- function(
+  score,
+  leaf_mask
+) {
+
+  class_matrix <- matrix(
+    0,
+    nrow = nrow(
+      score
+    ),
+    ncol = ncol(
+      score
+    )
+  )
+
+
+  positive_pixels <- (
+    leaf_mask &
+    score > 0
+  )
+
+
+  class_matrix[
+    positive_pixels
+  ] <- cut(
+    score[
+      positive_pixels
+    ],
+    breaks = class_breaks,
+    labels = FALSE,
+    right = TRUE
+  )
+
+
+  colour_matrix <- matrix(
+    "#FFFFFF",
+    nrow = nrow(
+      score
+    ),
+    ncol = ncol(
+      score
+    )
+  )
+
+
+  for (
+    class_index in seq_along(
+      brown_colours
+    )
+  ) {
+
+    colour_matrix[
+      leaf_mask &
+      class_matrix ==
+      class_index
+    ] <- brown_colours[
+      class_index
+    ]
+  }
+
+
+  colour_values <- col2rgb(
+    as.vector(
+      colour_matrix
+    )
+  ) / 255
+
+
+  rgb_array <- array(
+    1,
+    dim = c(
+      nrow(colour_matrix),
+      ncol(colour_matrix),
+      3
+    )
+  )
+
+
+  for (channel in 1:3) {
+
+    rgb_array[, , channel] <- matrix(
+      colour_values[channel, ],
+      nrow = nrow(
+        colour_matrix
+      )
+    )
+  }
+
+
+  rgb_array
+}
+
+
+############################################################
+# 13. Process all images
+############################################################
+
+all_images <- step7_input_table
+
+
+results <- vector(
+  "list",
+  nrow(all_images)
+)
+
+
+for (
+  i in seq_len(
+    nrow(all_images)
+  )
+) {
+
+  sample_id <-
+    all_images$MH_ID[i]
+
+
+  cat(
+    "\nQuantifying DAB staining for ",
+    sample_id,
+    "...\n",
+    sep = ""
+  )
+
+
+  results[[i]] <- tryCatch(
+
+    {
+
+      ######################################################
+      # Read image and exact Step-6 leaf mask
+      ######################################################
+
+      pair <- read_image_mask_pair(
+        all_images$analysis_image[i],
+        all_images$leaf_mask_file[i]
+      )
+
+
+      ######################################################
+      # Calculate pixel-level scores
+      ######################################################
+
+      components <- calculate_pixel_components(
+        pair$rgb
+      )
+
+
+      scores <- calculate_DAB_scores(
+        components,
+        pair$leaf_mask
+      )
+
+
+      ######################################################
+      # Extract scores within the leaf mask
+      ######################################################
+
+      leaf_brown <-
+        scores$brown_corrected[
+          pair$leaf_mask
+        ]
+
+      leaf_dark_rescue <-
+        scores$dark_rescue_only[
+          pair$leaf_mask
+        ]
+
+      leaf_combined <-
+        scores$combined_score[
+          pair$leaf_mask
+        ]
+
+
+      leaf_pixel_count <-
+        length(
+          leaf_combined
+        )
+
+
+      ######################################################
+      # Leaf-level DAB metrics
+      ######################################################
+
+      positive_pixel_count <- sum(
+        leaf_combined > 0
+      )
+
+
+      positive_area_percent <- (
+        100 *
+        positive_pixel_count /
+        leaf_pixel_count
+      )
+
+
+      ######################################################
+      # Primary normalized DAB burden
+      #
+      # Mean combined score across all pixels of the
+      # leaf mask. Non-positive pixels contribute zero.
+      #
+      # This combines staining extent and staining
+      # intensity in a single leaf-level value.
+      ######################################################
+
+      normalized_DAB_burden <- mean(
+        leaf_combined
+      )
+
+
+      brown_burden <- mean(
+        leaf_brown
+      )
+
+
+      dark_rescue_burden <- mean(
+        leaf_dark_rescue
+      )
+
+
+      ######################################################
+      # Positive-pixel intensity
+      ######################################################
+
+      mean_positive_score <- if (
+        any(
+          leaf_combined > 0
+        )
+      ) {
+
+        mean(
+          leaf_combined[
+            leaf_combined > 0
+          ]
+        )
+
+      } else {
+
+        NA_real_
+      }
+
+
+      ######################################################
+      # Save standardized QC map
+      ######################################################
+
+      map <- create_DAB_map(
+        scores$combined_score,
+        pair$leaf_mask
+      )
+
+
+      map_file <- file.path(
+        map_dir,
+        paste0(
+          sample_id,
+          "_DAB_map.png"
+        )
+      )
+
+
+      png::writePNG(
+        map,
+        map_file
+      )
+
+
+      ######################################################
+      # Save pixel-level scores
+      ######################################################
+
+      pixel_file <- file.path(
+        pixel_dir,
+        paste0(
+          sample_id,
+          "_DAB_scores.rds"
+        )
+      )
+
+
+      saveRDS(
+        list(
+          leaf_mask =
+            pair$leaf_mask,
+
+          brown_raw_score =
+            components$brown_raw_score,
+
+          mean_optical_density =
+            components$mean_optical_density,
+
+          brown_corrected =
+            scores$brown_corrected,
+
+          dark_rescue_only =
+            scores$dark_rescue_only,
+
+          combined_score =
+            scores$combined_score
+        ),
+        pixel_file,
+        compress = "gzip"
+      )
+
+
+      ######################################################
+      # Return leaf-level result
+      ######################################################
+
+      data.frame(
+
+        MH_ID =
+          sample_id,
+
+        image_role =
+          all_images$image_role[i],
+
+        leaf_pixel_count =
+          leaf_pixel_count,
+
+        DAB_positive_pixel_count =
+          positive_pixel_count,
+
+        DAB_positive_area_percent =
+          positive_area_percent,
+
+        mean_positive_DAB_score =
+          mean_positive_score,
+
+        brown_normalized_burden =
+          brown_burden,
+
+        dark_rescue_normalized_burden =
+          dark_rescue_burden,
+
+        DAB_burden =
+          normalized_DAB_burden,
+
+        DAB_map_file =
+          map_file,
+
+        pixel_score_file =
+          pixel_file,
+
+        success =
+          TRUE,
+
+        stringsAsFactors = FALSE
+      )
+    },
+
+
+    error = function(e) {
+
+      warning(
+        "Step 7 failed for ",
+        sample_id,
+        ": ",
+        conditionMessage(e)
+      )
+
+
+      data.frame(
+
+        MH_ID =
+          sample_id,
+
+        image_role =
+          all_images$image_role[i],
+
+        leaf_pixel_count = NA,
+
+        DAB_positive_pixel_count = NA,
+
+        DAB_positive_area_percent = NA,
+
+        mean_positive_DAB_score = NA,
+
+        brown_normalized_burden = NA,
+
+        dark_rescue_normalized_burden = NA,
+
+        DAB_burden = NA,
+
+        DAB_map_file = NA,
+
+        pixel_score_file = NA,
+
+        success =
+          FALSE,
+
+        stringsAsFactors = FALSE
+      )
+    }
+  )
+}
+
+
+############################################################
+# 14. Combine results
+############################################################
+
+DAB_results <- do.call(
+  rbind,
+  results
+)
+
+rownames(
+  DAB_results
+) <- NULL
+
+
+############################################################
+# 15. Save leaf-level results
+############################################################
+
+write.csv(
+  DAB_results,
+  file.path(
+    output_dir,
+    "step7_DAB_quantification.csv"
+  ),
+  row.names = FALSE
+)
+
+
+############################################################
+# 16. Prepare Step-8 handoff
+############################################################
+
+step8_input <- DAB_results[
+  DAB_results$success,
+]
+
+
+saveRDS(
+  list(
+    brown_nc_percentile =
+      brown_nc_percentile,
+
+    brown_cutoff =
+      brown_cutoff,
+
+    dark_nc_percentile =
+      dark_nc_percentile,
+
+    dark_cutoff =
+      dark_cutoff,
+
+    class_breaks =
+      class_breaks,
+
+    primary_metric =
+      "DAB_burden",
+
+    results =
+      step8_input
+  ),
+  file.path(
+    output_dir,
+    "step7_handoff_for_step8.rds"
+  ),
+  compress = "gzip"
+)
+
+
+############################################################
+# 17. Completion message
+############################################################
+
+cat(
+  "\nStep 7 completed successfully.\n"
+)
