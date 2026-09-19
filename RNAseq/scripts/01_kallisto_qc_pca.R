@@ -24,21 +24,37 @@ library(ggrepel)
 
 ############################################################
 # 2. Define input and output files
+#
+# The script assumes that it is run from the root directory
+# of the GitHub repository.
 ############################################################
 
-metadata_file <- paste0(
-  "/vol/data/digitalis_rnaseq/deseq2/",
-  "metadata/samples.csv"
+metadata_file <- file.path(
+  "RNAseq",
+  "metadata",
+  "samples.csv"
 )
 
-png_file <- paste0(
-  "/vol/data/digitalis_rnaseq/deseq2/",
-  "plots/PCA_initial_Kallisto_QC.png"
+output_dir <- file.path(
+  "RNAseq",
+  "plots"
 )
 
-svg_file <- paste0(
-  "/vol/data/digitalis_rnaseq/deseq2/",
-  "plots/PCA_initial_Kallisto_QC.svg"
+png_file <- file.path(
+  output_dir,
+  "PCA_initial_Kallisto_QC.png"
+)
+
+svg_file <- file.path(
+  output_dir,
+  "PCA_initial_Kallisto_QC.svg"
+)
+
+# Create output directory if it does not already exist
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
 )
 
 
@@ -256,7 +272,7 @@ pca_result <- prcomp(
 
 explained_variance <- (
   pca_result$sdev^2 /
-  sum(pca_result$sdev^2)
+    sum(pca_result$sdev^2)
 ) * 100
 
 
